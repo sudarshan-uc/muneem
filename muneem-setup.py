@@ -2567,7 +2567,18 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
                 # No language= hint: let Whisper auto-detect. Setting this to
                 # None at load time keeps the model multilingual; transcribe()
                 # will detect per call (cheap - uses the first 30s of mel).
-                _whisperx_model = whisperx.load_model(WHISPERX_MODEL, device, compute_type=compute_type)
+                #
+                # initial_prompt must be supplied via asr_options at load time -
+                # WhisperX's FasterWhisperPipeline.transcribe() does NOT accept
+                # initial_prompt as a per-call kwarg (it raises TypeError).
+                # asr_options is merged with faster-whisper's defaults, so we
+                # only need to set the keys we want to override.
+                _asr_options = {"initial_prompt": INITIAL_PROMPT}
+                _whisperx_model = whisperx.load_model(
+                    WHISPERX_MODEL, device,
+                    compute_type=compute_type,
+                    asr_options=_asr_options,
+                )
 
         audio = whisperx.load_audio(wav_path)
 
@@ -2575,7 +2586,7 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
         # pass it as a hint so Whisper skips re-detection on every segment.
         # Until then, let auto-detect run.
         _lang_hint = _session_language[0]
-        _t_kwargs = {"batch_size": 4, "initial_prompt": INITIAL_PROMPT}
+        _t_kwargs = {"batch_size": 4}
         if _lang_hint:
             _t_kwargs["language"] = _lang_hint
         result = _whisperx_model.transcribe(audio, **_t_kwargs)
