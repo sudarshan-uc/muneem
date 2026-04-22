@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "0.x"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install "ruff==0.6.9"
+
+      - name: Run ruff (critical errors only)
+        # Hard-fail on real errors: undefined names, syntax, unused imports that
+        # would crash at import time. Stylistic nits are not enforced yet.
+        run: ruff check --select=E9,F63,F7,F82 --target-version=py310 muneem-setup.py scripts/
+
+      - name: Run ruff (full rule set, informational)
+        continue-on-error: true
+        run: ruff check --target-version=py310 muneem-setup.py scripts/
+
+  syntax:
+    name: Syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile main file
+        run: python -m py_compile muneem-setup.py
+
+      - name: Compile scripts
+        run: python -m compileall -q scripts/
+
+  sanity:
+    name: Sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run sanity check
+        run: python scripts/sanity_check.py
+
+  version:
+    name: Version == 0.1.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract and assert version
+        run: |
+          VERSION=$(python -c "import re,pathlib; m=re.search(r'^__version__\s*=\s*[\"\\']([^\"\\']+)', pathlib.Path('muneem-setup.py').read_text(), re.M); print(m.group(1) if m else '')")
+          echo "Detected version: '$VERSION'"
+          if [ "$VERSION" != "0.1.0" ]; then
+            echo "::error::Expected muneem version 0.1.0, got '$VERSION'"
+            exit 1
+          fi

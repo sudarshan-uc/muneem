@@ -1,0 +1,28 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# mkdocs build output
+site/
+
+# macOS
+.DS_Store
+
+# Editor / local config
+.vscode/
+.idea/
+.claude/
+
+# Muneem runtime state (installer writes to ~/.muneem/, not here, but guard anyway)
+.muneem/
+*.log

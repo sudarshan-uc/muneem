@@ -1,0 +1,63 @@
+site_name: Muneem
+site_description: Offline AI meeting notepad for macOS Apple Silicon.
+site_url: https://sudarshan-uc.github.io/muneem/
+repo_url: https://github.com/sudarshan-uc/muneem
+repo_name: sudarshan-uc/muneem
+
+docs_dir: .
+site_dir: site
+
+# mkdocs-material lets us serve markdown files straight from the repo root
+# without moving them into a docs/ subfolder.
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.top
+    - content.code.copy
+    - toc.integrate
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+nav:
+  - Home: INSTALL.md
+  - Install: INSTALL.md
+  - Usage: USAGE.md
+  - Architecture: Build-Muneem.md
+  - Local LLM Guide: Local-LLM-Setup-Guide.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+exclude_docs: |
+  .github/
+  scripts/
+  muneem-setup.py
+  muneem-traces.txt
+  LICENSE
+  mkdocs.yml
