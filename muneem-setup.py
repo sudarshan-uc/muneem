@@ -1526,23 +1526,36 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
     TMP_DIR = MUNEEM_HOME / "tmp"
     RATE = 16000
     CHANNELS = 1
-    SEGMENT_DURATION = 5
+    # 30s aligns with Whisper's training window for maximum accuracy. Shorter
+    # segments lose sentence context and force beam search to operate on
+    # fragments, which increases hallucinations and word-drop at boundaries.
+    # On CPU, large-v3 transcribes 30s of audio in ~10-15s on M1/M2, so the
+    # pipeline still keeps up in real-time. If the user explicitly wants
+    # lower latency feedback, `muneem start --post-process` records first and
+    # transcribes later with zero CPU contention during the call.
+    SEGMENT_DURATION = 30
     # Silence detection tuning.
     #
     # SILENCE_THRESHOLD is the RMS gate (below this = skip transcription).
-    # Previous value (500) was tuned for mic audio and was too aggressive for
-    # system-loopback captures of Zoom/Teams where the host signal averages
-    # RMS ~100-200 with short bursts up to 2000-3000. Lowering to 150 keeps
-    # legitimately silent periods out of the whisper pipeline while catching
-    # normal conversation.
+    # Lowered from 150 to 80 so quiet speakers / soft-spoken participants
+    # on conference calls don't get dropped entirely. Whisper itself will
+    # handle true silence cheaply; the gate is here only to avoid loading
+    # the model for a fully dead segment.
     #
     # PEAK_SILENCE_AMP is the peak-amplitude gate - if any sample exceeds
     # this, we treat the segment as non-silent regardless of RMS, so that a
-    # short burst of speech in an otherwise quiet 8-second window isn't
-    # filtered out.
-    SILENCE_THRESHOLD = 150
-    PEAK_SILENCE_AMP = 800
+    # short burst of speech in an otherwise quiet window isn't filtered out.
+    SILENCE_THRESHOLD = 80
+    PEAK_SILENCE_AMP = 500
     WHISPERX_MODEL = "large-v3"
+
+    # Bias Whisper toward meeting vocabulary. Keeps proper nouns, acronyms,
+    # and technical terms from being normalised away. Kept short to avoid
+    # eating into Whisper's 224-token prompt budget.
+    INITIAL_PROMPT = (
+        "Business meeting transcript. Preserve names, acronyms, product "
+        "names, and technical terms exactly as spoken."
+    )
 
 
     def _has_native_helper() -> bool:
@@ -2312,10 +2325,15 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
 
 
     # ── Model cache (loaded once per session, reused across segments) ──
+    # Language is auto-detected by Whisper on the first segment that contains
+    # speech. The detected language pins the alignment model we load: align
+    # models are language-specific, so swapping them per segment would be
+    # expensive. We keep a small dict keyed by language code so a meeting
+    # that legitimately switches languages (rare) still works correctly.
     _model_lock = threading.Lock()
     _whisperx_model = None
-    _align_model = None
-    _align_metadata = None
+    _align_cache = {}  # language_code -> (align_model, align_metadata)
+    _session_language = [None]  # pinned after first confident detection
 
     # sherpa-onnx diarization handles - lazily loaded on first use.
     _sherpa_diar = None     # sherpa_onnx.OfflineSpeakerDiarization instance
@@ -2522,7 +2540,7 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
 
 
     def transcribe_and_diarize(wav_path: str, run_diarization: bool = True) -> list[dict]:
-        global _whisperx_model, _align_model, _align_metadata
+        global _whisperx_model
         import warnings
         # Suppress noisy upstream deprecation/config warnings that clutter output.
         warnings.filterwarnings("ignore", category=UserWarning, module="silero_vad")
@@ -2546,16 +2564,45 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
         with _model_lock:
             if _whisperx_model is None:
                 print("[muneem] Loading WhisperX model (first segment only)...")
-                _whisperx_model = whisperx.load_model(WHISPERX_MODEL, device, compute_type=compute_type, language="en")
+                # No language= hint: let Whisper auto-detect. Setting this to
+                # None at load time keeps the model multilingual; transcribe()
+                # will detect per call (cheap - uses the first 30s of mel).
+                _whisperx_model = whisperx.load_model(WHISPERX_MODEL, device, compute_type=compute_type)
 
         audio = whisperx.load_audio(wav_path)
-        result = _whisperx_model.transcribe(audio, batch_size=4)
+
+        # If the session has already pinned a language from a previous segment,
+        # pass it as a hint so Whisper skips re-detection on every segment.
+        # Until then, let auto-detect run.
+        _lang_hint = _session_language[0]
+        _t_kwargs = {"batch_size": 4, "initial_prompt": INITIAL_PROMPT}
+        if _lang_hint:
+            _t_kwargs["language"] = _lang_hint
+        result = _whisperx_model.transcribe(audio, **_t_kwargs)
+
+        detected_lang = result.get("language") or _lang_hint or "en"
+        # Pin the first confidently detected language for the rest of the
+        # session. Subsequent segments will reuse the same alignment model.
+        if _session_language[0] is None and result.get("language"):
+            _session_language[0] = detected_lang
 
         with _model_lock:
-            if _align_model is None:
-                _align_model, _align_metadata = whisperx.load_align_model(language_code="en", device=device)
-
-        result = whisperx.align(result["segments"], _align_model, _align_metadata, audio, device)
+            cached = _align_cache.get(detected_lang)
+            if cached is None:
+                try:
+                    am, amd = whisperx.load_align_model(language_code=detected_lang, device=device)
+                    _align_cache[detected_lang] = (am, amd)
+                    cached = (am, amd)
+                except Exception as e:
+                    # Some languages don't have a default wav2vec2 alignment
+                    # model in whisperx. Fall through without alignment rather
+                    # than crash the whole transcript.
+                    print(f"[muneem] Alignment model unavailable for '{detected_lang}' ({e}); "
+                          f"continuing with un-aligned word timings.")
+                    cached = None
+        if cached is not None:
+            _align_model, _align_metadata = cached
+            result = whisperx.align(result["segments"], _align_model, _align_metadata, audio, device)
 
         diarize_map = {}
         if run_diarization:
@@ -2614,16 +2661,19 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
 
     import re
 
+    # Only genuine non-lexical disfluencies. Real English words like "so",
+    # "like", "right", "actually", "basically", "you know", "I mean" carry
+    # meaning and are intentionally NOT stripped - stripping them destroyed
+    # accuracy in earlier versions (users reported dropped words).
     _FILLER_PATTERN = re.compile(
-        r"\\b("
-        r"uh+|um+|uhm+|hmm+|hm+|ah+|aam+|aa+|er+|erm+|"
-        r"mhm+|mm+|mmhm+|uh huh|you know|i mean|like|so|"
-        r"basically|actually|right|okay so|yeah so"
-        r")\\b",
+        r"\\b(uh+|um+|uhm+|hmm+|hm+|ah+|er+|erm+|mhm+|mm+|mmhm+|uh huh)\\b",
         re.IGNORECASE,
     )
     _MULTI_SPACE = re.compile(r"  +")
-    _STUTTER_PATTERN = re.compile(r"\\b(\\w+)(\\s+\\1){1,}\\b", re.IGNORECASE)
+    # Only collapse 3+ consecutive identical words. 2x repetition is common
+    # emphasis in natural speech ("very very good", "no no", "yes yes") and
+    # must be preserved.
+    _STUTTER_PATTERN = re.compile(r"\\b(\\w+)(\\s+\\1){2,}\\b", re.IGNORECASE)
 
 
     def _clean_text(text: str) -> str:
@@ -2638,17 +2688,24 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
 
 
     def _deduplicate_segments(segments: list[dict]) -> list[dict]:
+        """Conservative dedup: only merges segments when they genuinely overlap
+        in time AND share the same speaker AND share the same text. The old
+        prefix-based heuristic (if next.startswith(prev)) was unsafe - two
+        different speakers both starting with 'I think...' would lose one of
+        them entirely. Timestamp-based merging cannot drop real content.
+        """
         if not segments:
             return segments
         deduped = [segments[0]]
         for seg in segments[1:]:
             prev = deduped[-1]
-            if seg["text"] == prev["text"] and seg["speaker"] == prev["speaker"]:
-                prev["end"] = seg["end"]
-                continue
-            if prev["text"] and seg["text"].startswith(prev["text"]):
-                prev["text"] = seg["text"]
-                prev["end"] = seg["end"]
+            same_speaker = seg.get("speaker") == prev.get("speaker")
+            same_text = seg.get("text", "").strip() == prev.get("text", "").strip()
+            time_overlap = float(seg.get("start", 0)) < float(prev.get("end", 0))
+            if same_speaker and same_text and time_overlap:
+                # Same words, same speaker, overlapping timestamps = one
+                # utterance split across segment boundaries. Extend prev.
+                prev["end"] = max(float(prev.get("end", 0)), float(seg.get("end", 0)))
                 continue
             deduped.append(seg)
         return deduped
@@ -3003,7 +3060,7 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
 
         def _recorder_thread():
             nonlocal backend, bh_index
-            _reprobe_every = 12  # re-check output device every ~60s (12 × 5s)
+            _reprobe_every = 2   # re-check output device every ~60s (2 * 30s)
             while not _stop.is_set():
                 seg_id = seg_counter[0]
                 seg_counter[0] += 1
@@ -3053,6 +3110,11 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
                     lag_s = depth * SEGMENT_DURATION
                     print(f"[muneem] Transcription backlog: {depth} segments (~{lag_s}s behind). "
                           f"All audio is being recorded - transcripts will catch up.")
+                    # Only nudge toward post-process mode once, on the first warn.
+                    if _q_warned_at[0] == depth and depth == _Q_WARN_THRESHOLD:
+                        print("[muneem] Tip: for heavy calls, re-run with "
+                              "`muneem start --post-process` to record only "
+                              "during the call and transcribe after stop.")
 
         # Daemon thread so a stuck sox/native child doesn't block process exit.
         # Combined with _kill_active_procs() below, Ctrl+C is responsive.
@@ -3060,7 +3122,7 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
         recorder.start()
 
         _deferred_banner_shown = [False]
-        _deferred_notice_every = 12   # every ~60s (12 × 5s)
+        _deferred_notice_every = 2    # every ~60s (2 * 30s)
         try:
             while not _stop.is_set():
                 try:
@@ -4997,7 +5059,7 @@ _MODULE_APP = textwrap.dedent('''\
         if session.defer_transcription:
             print("  \\033[92m\\u2713\\033[0m  Recording started (batch mode - transcription runs after stop).\\n")
         else:
-            print("  \\033[92m\\u2713\\033[0m  Transcription starting (pipelined, ~5s segments, no gaps)...\\n")
+            print("  \\033[92m\\u2713\\033[0m  Transcription starting (pipelined, ~30s segments, no gaps)...\\n")
 
         try:
             session.start_transcription(backend=backend, follow_pids=follow_pids)
@@ -5483,7 +5545,7 @@ _MODULE_APP = textwrap.dedent('''\
              Vision model reads participant names and maps them to diarized audio.
              Use --no-screen to disable.
       Audio: Core Audio Tap (default) with BlackHole fallback.
-      Transcription: WhisperX large-v3 with forced alignment (~5s pipelined segments).
+      Transcription: WhisperX large-v3 with forced alignment (~30s pipelined segments, auto-detect language).
       Diarization: sherpa-onnx (pyannote-seg + 3D-Speaker CAM++) with `diarize` fallback.
                    Session-scoped SpeakerRegistry keeps Speaker 0/1/2 labels stable
                    across segments. Fully offline, Apache-2.0, no tokens needed.
