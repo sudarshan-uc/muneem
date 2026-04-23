@@ -4,11 +4,15 @@ site_url: https://sudarshan-uc.github.io/muneem/
 repo_url: https://github.com/sudarshan-uc/muneem
 repo_name: sudarshan-uc/muneem
 
-docs_dir: .
+docs_dir: docs
 site_dir: site
 
-# mkdocs-material lets us serve markdown files straight from the repo root
-# without moving them into a docs/ subfolder.
+# The canonical markdown files (INSTALL.md, USAGE.md, etc.) live at the
+# repo root so they render on GitHub and can be opened by a user cloning
+# the repo. The docs/ directory is assembled by the Docs workflow as
+# symlinks to those root files before `mkdocs build` runs, which keeps
+# one source of truth while satisfying mkdocs 1.6+'s requirement that
+# docs_dir be a child of the config file.
 
 theme:
   name: material
@@ -35,7 +39,7 @@ theme:
         name: Switch to light mode
 
 nav:
-  - Home: INSTALL.md
+  - Home: index.md
   - Install: INSTALL.md
   - Usage: USAGE.md
   - Architecture: Build-Muneem.md
@@ -53,11 +57,3 @@ markdown_extensions:
   - tables
   - toc:
       permalink: true
-
-exclude_docs: |
-  .github/
-  scripts/
-  muneem-setup.py
-  muneem-traces.txt
-  LICENSE
-  mkdocs.yml

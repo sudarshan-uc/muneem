@@ -15,6 +15,10 @@ dist/
 # mkdocs build output
 site/
 
+# mkdocs staging dir - assembled by the Docs workflow as symlinks to
+# the root markdown files. Never committed.
+docs/
+
 # macOS
 .DS_Store
 

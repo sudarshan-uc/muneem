@@ -55,6 +55,40 @@ jobs:
       - name: Install mkdocs-material
         run: pip install "mkdocs-material==9.5.39" "pymdown-extensions==10.11.2"
 
+      - name: Stage docs/ directory
+        # mkdocs 1.6+ requires docs_dir to be a child of the config file.
+        # The canonical markdown lives at the repo root; symlink it into
+        # docs/ so we keep one source of truth.
+        run: |
+          mkdir -p docs
+          for f in INSTALL.md USAGE.md Build-Muneem.md Local-LLM-Setup-Guide.md; do
+            ln -sf "../$f" "docs/$f"
+          done
+          cat > docs/index.md <<'EOF'
+          # Muneem
+
+          **Offline AI meeting notepad for macOS Apple Silicon.**
+
+          Muneem runs entirely on your Mac — no cloud, no account, no API keys.
+          It records a selected call window, transcribes with WhisperX, tracks
+          speakers with Qwen3-VL, and produces structured notes with a local
+          LLM.
+
+          ## Get started
+
+          - [Install](INSTALL.md) — 10-step installer, one command.
+          - [Usage](USAGE.md) — `muneem start`, `muneem doctor`, and friends.
+          - [Architecture](Build-Muneem.md) — how the pieces fit together.
+          - [Local LLM setup](Local-LLM-Setup-Guide.md) — choose and run a
+            local model.
+
+          ## Pre-release binary
+
+          A single-file installer is published to the public
+          [muneem-release](https://github.com/sudarshan-uc/muneem-release)
+          repository. Grab the latest alpha from that repo's Releases page.
+          EOF
+
       - name: Build site
         run: mkdocs build --strict
 
