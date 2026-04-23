@@ -1,0 +1,96 @@
+name: Docs
+
+# Renders the markdown docs (INSTALL.md, USAGE.md, Build-Muneem.md,
+# Local-LLM-Setup-Guide.md) into a static site with mkdocs-material.
+#
+# Behaviour:
+#   - pull_request to main ........ build-only. Uploads the rendered site as
+#                                   an artifact for preview. No deploy.
+#   - push to main ................ build + deploy to GitHub Pages. Only
+#                                   runs if `deploy_docs` input is unset
+#                                   (defaults to true) or the push event
+#                                   triggers it.
+#   - workflow_dispatch ........... manual run. `deploy_docs` input selects
+#                                   build-only vs. deploy.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_docs:
+        description: "Deploy rendered docs to GitHub Pages"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.decide.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install mkdocs-material
+        run: pip install "mkdocs-material==9.5.39" "pymdown-extensions==10.11.2"
+
+      - name: Build site
+        run: mkdocs build --strict
+
+      - name: Upload build artifact (preview)
+        uses: actions/upload-artifact@v4
+        with:
+          name: muneem-docs-site
+          path: site/
+          retention-days: 14
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Decide whether to deploy
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.deploy_docs }}" = "true" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    if: needs.build.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

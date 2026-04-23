@@ -1,0 +1,55 @@
+# Pre-commit hook config for muneem.
+#
+# First-time setup (once per clone):
+#   pip install pre-commit      # or: brew install pre-commit
+#   pre-commit install          # wires hooks into .git/hooks/pre-commit
+#
+# After that, every `git commit` will run the hooks below against the
+# staged files and abort the commit if any hook fails.
+#
+# Run manually against every file at any time:
+#   pre-commit run --all-files
+#
+# Hooks mirror the CI workflow (.github/workflows/ci.yml) so a commit that
+# passes locally will not get rejected by CI for the same reason.
+
+repos:
+  # ─── Baseline hygiene ──────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+
+  # ─── Lint (matches CI's strict ruleset) ────────────────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        name: ruff (critical errors only)
+        args:
+          - --select=E9,F63,F7,F82
+          - --target-version=py310
+        files: \.py$
+
+  # ─── Local-only hooks ─────────────────────────────────────────────────────
+  - repo: local
+    hooks:
+      - id: py-compile-setup
+        name: python -m py_compile muneem-setup.py
+        entry: python3 -m py_compile
+        language: system
+        files: ^muneem-setup\.py$
+        pass_filenames: true
+
+      - id: sanity-check
+        name: repo sanity check (scripts/sanity_check.py)
+        entry: python3 scripts/sanity_check.py
+        language: system
+        pass_filenames: false
+        always_run: true
