@@ -26,3 +26,9 @@ site/
 # Muneem runtime state (installer writes to ~/.muneem/, not here, but guard anyway)
 .muneem/
 *.log
+
+# Recorded install / runtime traces. These capture real meeting transcripts,
+# window titles, and other PII - never commit.
+muneem-traces.txt
+*.trace
+traces/
