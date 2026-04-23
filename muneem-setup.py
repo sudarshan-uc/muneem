@@ -4578,6 +4578,69 @@ _MODULE_APP = textwrap.dedent('''\
                 print(f"  \\033[92m\\u2713\\033[0m  Speaker mapping: {mapping}")
             return rewritten
 
+        def start_follow_watchdog(self, pid, label="selected app", poll_s=2.0, debounce=2):
+            """Stop the session when the selected app's PID exits.
+
+            If the user quits the selected call window (e.g. Zoom) without
+            hitting Ctrl+C, the recorder otherwise keeps running and produces
+            a transcript full of silence. This polls the owner PID with
+            os.kill(pid, 0) every poll_s seconds and, after `debounce`
+            consecutive ESRCH hits, sets _stop_event so the transcription
+            loop exits cleanly and notes are generated as if Ctrl+C was hit.
+
+            Debounce absorbs the brief window where a process has exited but
+            its PID has not yet been reaped (zombie) on macOS. EPERM means
+            the process exists but we can't signal it - treat as alive.
+            """
+            try:
+                pid = int(pid) if pid is not None else None
+            except (TypeError, ValueError):
+                pid = None
+            if not pid or pid <= 1:
+                return False
+
+            import errno as _errno
+
+            def _alive(p: int) -> bool:
+                try:
+                    os.kill(p, 0)
+                    return True
+                except ProcessLookupError:
+                    return False
+                except PermissionError:
+                    return True  # exists, we just can't signal it
+                except OSError as e:
+                    # ESRCH = no such process; anything else: assume alive to
+                    # avoid stopping the session on a transient error.
+                    return getattr(e, "errno", None) != _errno.ESRCH
+
+            if not _alive(pid):
+                print(f"  \\033[93m!\\033[0m  {label} (pid {pid}) is not running; "
+                      f"watchdog not started.")
+                return False
+
+            def _watch():
+                misses = 0
+                while not self._stop_event.is_set():
+                    if _alive(pid):
+                        misses = 0
+                    else:
+                        misses += 1
+                        if misses >= debounce:
+                            print(f"\\n  \\033[93m\\u25c6\\033[0m  {label} (pid {pid}) "
+                                  f"has closed. Stopping transcription and "
+                                  f"generating notes...", flush=True)
+                            self._stop_event.set()
+                            return
+                    # Wait with interruptible sleep so Ctrl+C still feels snappy.
+                    if self._stop_event.wait(timeout=poll_s):
+                        return
+
+            t = threading.Thread(target=_watch, name="follow-watchdog", daemon=True)
+            t.start()
+            self._follow_watchdog = t
+            return True
+
         def start_transcription(self, backend, follow_pids=None):
             stream_transcribe(
                 backend=backend,
@@ -4951,6 +5014,11 @@ _MODULE_APP = textwrap.dedent('''\
         # Chrome, Edge), audio is produced by a renderer subprocess, so we
         # also include ALL descendant PIDs of the window-owner.
         follow_pids = None
+        # Hoisted so the follow-app watchdog (set up below) can see the owner
+        # PID after this try/except block. Without this the name would only
+        # exist inside the try and be unreachable later.
+        follow_owner_pid = None
+        follow_owner_label = None
         if window_id is not None:
             try:
                 # Find the window owner's PID.
@@ -4959,8 +5027,10 @@ _MODULE_APP = textwrap.dedent('''\
                 for w in all_wins:
                     if w.get("id") == window_id:
                         owner_pid = w.get("pid")
+                        follow_owner_label = (w.get("label") or w.get("owner") or "selected app")
                         break
                 if owner_pid:
+                    follow_owner_pid = int(owner_pid)
                     # Collect descendants (Chromium renderers are children of
                     # the browser main process and produce the actual audio).
                     pids = {int(owner_pid)}
@@ -5042,6 +5112,9 @@ _MODULE_APP = textwrap.dedent('''\
         print(f"\\u2551  Mode:         {mode_line[:41]:<41}\\u2551")
         print("\\u2551                                                          \\u2551")
         print("\\u2551  Press Ctrl+C to stop and generate notes.                \\u2551")
+        if follow_owner_pid:
+            _stop_line = (f"  (or close {(follow_owner_label or 'the call')[:38]} - auto-stops)")
+            print(f"\\u2551{_stop_line[:58]:<58}\\u2551")
         print("\\u255a" + "\\u2550" * 58 + "\\u255d")
         print()
 
@@ -5055,6 +5128,20 @@ _MODULE_APP = textwrap.dedent('''\
             enable_screen=enable_screen,
             defer_transcription=getattr(args, "post_process", False),
         )
+
+        # Auto-stop transcription when the selected call app/window exits.
+        # Only armed when the user picked a specific window (so the watchdog
+        # has a concrete PID to follow) - omitted for whole-display capture.
+        if follow_owner_pid:
+            started = session.start_follow_watchdog(
+                follow_owner_pid,
+                label=follow_owner_label or "selected app",
+            )
+            if started:
+                print(f"  \\033[92m\\u2713\\033[0m  Follow-app watchdog armed: "
+                      f"transcription will stop automatically if "
+                      f"{follow_owner_label or 'the selected app'} "
+                      f"(pid {follow_owner_pid}) exits.")
 
         if enable_screen:
             session.start_screen_capture(
