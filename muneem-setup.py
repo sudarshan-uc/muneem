@@ -2878,6 +2878,48 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
     # Track BlackHole-silent-but-mic-active streaks to warn about audio routing.
     _bh_silent_streak = [0]
     _bh_warned = [False]
+    # Track acoustic-echo suppression. When the user listens on speakers instead
+    # of headphones, the built-in mic re-records the remote speakers' voices, and
+    # the same words get transcribed twice - once as [Speaker N] (from the tap)
+    # and once as [You] (from the mic). We drop the mic copy.
+    _echo_suppressed_total = [0]
+    _echo_warned = [False]
+
+
+    def _normalize_for_echo_match(text: str) -> str:
+        import re as _re
+        t = (text or "").lower()
+        t = _re.sub(r"[^a-z0-9 ]+", " ", t)
+        t = _re.sub(r"\\s+", " ", t).strip()
+        return t
+
+
+    def _mic_segment_is_echo(mic_seg: dict, sys_segs: list[dict],
+                             time_tol: float = 3.0,
+                             sim_thresh: float = 0.72) -> bool:
+        """True if a mic segment looks like an echo of one of the sys segments
+        from the same round (rough time overlap + high text similarity)."""
+        import difflib
+        m_text = _normalize_for_echo_match(mic_seg.get("text", ""))
+        if not m_text:
+            return False
+        m_start = float(mic_seg.get("start", 0) or 0)
+        m_end = float(mic_seg.get("end", 0) or 0)
+        for ss in sys_segs:
+            s_text = _normalize_for_echo_match(ss.get("text", ""))
+            if not s_text:
+                continue
+            s_start = float(ss.get("start", 0) or 0)
+            s_end = float(ss.get("end", 0) or 0)
+            if s_end + time_tol < m_start or s_start - time_tol > m_end:
+                continue
+            if m_text == s_text:
+                return True
+            if len(m_text) >= 12 and (m_text in s_text or s_text in m_text):
+                return True
+            if difflib.SequenceMatcher(None, m_text, s_text).ratio() >= sim_thresh:
+                return True
+        return False
 
 
     def _cleanup_wavs(*paths):
@@ -2937,14 +2979,36 @@ _MODULE_TRANSCRIBER = textwrap.dedent('''\
             # Both tracks have audio - ideal case.
             # Mic = "You", system audio = diarized remote speakers.
             mic_segs = transcribe_and_diarize(mic_wav, run_diarization=False)
-            for seg in mic_segs:
-                seg["speaker"] = "You"
-            all_segments.extend(mic_segs)
-
             sys_segs = transcribe_and_diarize(sys_wav, run_diarization=True)
             for seg in sys_segs:
                 if seg["speaker"] == "Unknown":
                     seg["speaker"] = "Other"
+
+            # Acoustic-echo suppression: when the user is on speakers (not
+            # headphones), the built-in mic picks up the remote speakers'
+            # voices, Whisper re-transcribes them, and the mic copy gets
+            # mis-labelled [You]. Drop mic segments that duplicate sys audio.
+            kept_mic = []
+            dropped_echo = 0
+            for m in mic_segs:
+                if _mic_segment_is_echo(m, sys_segs):
+                    dropped_echo += 1
+                    continue
+                m["speaker"] = "You"
+                kept_mic.append(m)
+            if dropped_echo:
+                _echo_suppressed_total[0] += dropped_echo
+                if _echo_suppressed_total[0] >= 8 and not _echo_warned[0]:
+                    _echo_warned[0] = True
+                    print(
+                        "\\n  \\033[93m\\u26a0\\033[0m  Acoustic echo detected: your mic is "
+                        "picking up meeting audio from your speakers.\\n"
+                        "      Muneem is suppressing the duplicated [You] lines.\\n"
+                        "      For cleaner attribution, use headphones or route output\\n"
+                        "      through a Multi-Output Device that includes BlackHole 2ch.\\n",
+                        flush=True,
+                    )
+            all_segments.extend(kept_mic)
             all_segments.extend(sys_segs)
 
         elif has_two_tracks and sys_silent and not mic_silent:
