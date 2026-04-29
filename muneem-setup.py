@@ -3539,11 +3539,63 @@ _MODULE_SCREEN_READER = textwrap.dedent('''\
         return response.json()["response"]
 
 
-    def _capture_loop(interval: int, stop_event: threading.Event, display_index: int | None = None, window_id: int | None = None):
-        """Capture screenshots at regular intervals. Falls back to full screen if target window closes."""
+    # ── Perceptual-hash dedup ─────────────────────────────────────────────────
+    # Cheap fingerprint: 16x16 grayscale -> binary (pixel >= mean). Two frames
+    # whose Hamming distance is <= AHASH_DUP_THRESHOLD are treated as the same
+    # screen. Threshold tuned so cursor/clock-tick changes don't count, but a
+    # slide change, scroll, or new participant tile does. Falls back to "store
+    # everything" if Pillow isn't available.
+    _AHASH_SIZE = 16
+    _AHASH_DUP_THRESHOLD = 10  # bits of difference. ~256-bit fingerprint.
+
+    def _ahash(path: str):
+        try:
+            from PIL import Image
+            img = Image.open(path).convert("L").resize((_AHASH_SIZE, _AHASH_SIZE), Image.LANCZOS)
+            px = list(img.getdata())
+            avg = sum(px) / len(px)
+            bits = 0
+            for i, v in enumerate(px):
+                if v >= avg:
+                    bits |= (1 << i)
+            return bits
+        except Exception:
+            return None
+
+    def _ahash_distance(a, b):
+        if a is None or b is None:
+            return 1 << 30
+        return bin(a ^ b).count("1")
+
+
+    def _capture_loop(interval: int, stop_event: threading.Event,
+                      display_index: int | None = None, window_id: int | None = None,
+                      archive_dir: str | None = None,
+                      archive_state: dict | None = None):
+        """Capture screenshots at regular intervals. Falls back to full screen if target window closes.
+
+        archive_dir: if set, every visually-distinct frame is copied here as
+            <HHMMSS_NN>.png. Dedup is by perceptual hash so slide changes /
+            new tiles / shared content all get archived but cursor flicker
+            does not. The session can later read this folder to know exactly
+            what was on screen and when.
+        archive_state: shared dict {last_hash, count, hashes:list} the caller
+            can read after the loop ends to know how many frames were saved.
+        """
         _ensure_dir()
         fail_count = 0
         active_window_id = window_id
+        if archive_dir:
+            try:
+                os.makedirs(archive_dir, exist_ok=True)
+            except OSError:
+                archive_dir = None
+        if archive_state is None:
+            archive_state = {}
+        archive_state.setdefault("last_hash", None)
+        archive_state.setdefault("count", 0)
+        archive_state.setdefault("frames", [])  # [(epoch, filename), ...]
+
         while not stop_event.is_set():
             cmd = ["screencapture", "-x"]
             if active_window_id is not None:
@@ -3558,12 +3610,43 @@ _MODULE_SCREEN_READER = textwrap.dedent('''\
             if os.path.exists(_TMP_FRAME) and os.path.getsize(_TMP_FRAME) > 0:
                 os.replace(_TMP_FRAME, LATEST_FRAME)
                 fail_count = 0
+                # Archive if visually distinct from the last kept frame.
+                if archive_dir:
+                    try:
+                        h = _ahash(LATEST_FRAME)
+                        if h is None:
+                            # No PIL: archive every Nth frame as a safety net.
+                            archive_state["count"] += 1
+                            if archive_state["count"] % 30 == 0:
+                                _archive_frame(LATEST_FRAME, archive_dir, archive_state)
+                        else:
+                            dist = _ahash_distance(h, archive_state["last_hash"])
+                            if dist > _AHASH_DUP_THRESHOLD:
+                                archive_state["last_hash"] = h
+                                _archive_frame(LATEST_FRAME, archive_dir, archive_state)
+                    except Exception:
+                        pass
             else:
                 fail_count += 1
                 if fail_count == 3 and active_window_id is not None:
                     print("[muneem] Target window may have closed. Falling back to full screen.")
                     active_window_id = None
             stop_event.wait(interval)
+
+
+    def _archive_frame(src_path: str, archive_dir: str, archive_state: dict):
+        """Copy LATEST_FRAME into archive_dir with an ordered timestamped name."""
+        import shutil as _sh
+        archive_state["count"] += 1
+        ts = time.strftime("%H%M%S")
+        idx = archive_state["count"]
+        name = f"{ts}_{idx:04d}.png"
+        out = os.path.join(archive_dir, name)
+        try:
+            _sh.copyfile(src_path, out)
+            archive_state["frames"].append((time.time(), name))
+        except OSError:
+            pass
 
 
     # ── Vision prompt ─────────────────────────────────────────────────────────
@@ -3794,8 +3877,38 @@ _MODULE_ENHANCER = textwrap.dedent('''\
     (Anything from screen context that was visibly referenced during the meeting - e.g. docs, code, dashboards. Omit this section if nothing notable.)
     """
 
+    # Minimalist template - just who was there and what was discussed.
+    # Useful when the user wants a glance-readable record without the
+    # full decisions/action-items/tech-summary scaffolding.
+    BRIEF_TEMPLATE = """Produce a minimal record of the meeting.
+    Work ONLY from the provided transcript, screen context, and user notes.
+    Do not invent content. Remove filler words, stutters, and repeated phrases.
+
+    Resolve speaker labels: prefer real names (already in the transcript via
+    vision matching). If a diarized label like "Speaker 2" remains, keep it.
+    Treat any name variants ("Moneesh" / "Moneesh Reddy" / "M. Reddy") as the
+    same person under their longest seen form.
+
+    Output format (markdown, follow exactly - no extra sections):
+    ## Meeting -- {date}
+
+    ### Participants
+    (Bullet list. One line per person: **Name** - role/team if apparent.)
+
+    ### Topics Discussed
+    (Bullet list. Each bullet is one topic in 1-2 sentences, focused on the
+    information shared - not on who said what. Group related sub-points
+    under the parent topic.)
+
+    ### On-Screen Content
+    (Bullet list of distinct content seen on screen during the meeting -
+    apps, documents, slides, code, dashboards. One line each. Omit this
+    section if nothing notable was shared.)
+    """
+
     TEMPLATES = {
         "default": DEFAULT_TEMPLATE,
+        "brief":   BRIEF_TEMPLATE,
 
         "standup": """Produce standup meeting notes from the transcript and context.
     The transcript includes speaker labels. Remove all filler words, stutters, and repeated phrases - output only clean sentences.
@@ -4463,6 +4576,99 @@ _MODULE_APP = textwrap.dedent('''\
             # Performance tracking (for the summary line at end of session).
             self.vision_latencies_ms: list[int] = []
 
+            # Screenshot archive (populated by start_screen_capture).
+            self._screen_archive_dir: str | None = None
+            self._screen_archive_state: dict = {"last_hash": None, "count": 0, "frames": []}
+
+            # Live speaker-name resolution: latest high-confidence active_speaker
+            # from vision, used by on_transcript to rewrite generic "Speaker N"
+            # labels in real time (instead of waiting until end-of-session).
+            # Format: (epoch, canonical_name).
+            self._latest_active_speaker: tuple = (0.0, "")
+            # Canonical-name map: variant_lowercase -> canonical name.
+            # Populated as vision reports new participant lists. "Moneesh",
+            # "moneesh reddy", "M. Reddy" all collapse to a single canonical
+            # form (longest variant with most tokens wins).
+            self._name_canonical: dict = {}
+
+            # Crash-recovery: stream every event to NOTES_DIR/<ts>.partial.jsonl
+            # with fsync, so a hard crash (segfault in audio/vision/whisper code)
+            # leaves enough state on disk to reconstruct the transcript on next
+            # run. Plain in-memory state used to vanish on any non-Python crash.
+            self._partial_path = NOTES_DIR / (
+                self.start_time.strftime("%Y%m%d_%H%M%S") + ".partial.jsonl"
+            )
+            # Companion human-readable file for `tail -f`. Lives next to the
+            # JSONL in NOTES_DIR (NOT TMP_DIR, which is auto-swept and where
+            # users wouldn't think to look after a crash). Both files share
+            # the same lifetime: created on session start, deleted together
+            # by finalize_partial() on success.
+            self._live_path = NOTES_DIR / (
+                self.start_time.strftime("%Y%m%d_%H%M%S") + ".live.txt"
+            )
+            try:
+                self._partial_fh = open(self._partial_path, "a", buffering=1)
+                self._log_event("session_start", {
+                    "start_time": self.start_time.isoformat(),
+                    "template": self.template,
+                    "enable_screen": self.enable_screen,
+                    "defer_transcription": self.defer_transcription,
+                    "pid": os.getpid(),
+                })
+            except OSError:
+                # Disk full / permission - degrade gracefully, still run.
+                self._partial_fh = None
+
+        def _log_event(self, kind, payload):
+            """Append one JSONL line to the partial log and fsync. Idempotent
+            best-effort - never raises into the caller (we don't want a logging
+            failure to break a live meeting). Uses default=str so datetime /
+            numpy scalars don't blow up json.dumps."""
+            if not getattr(self, "_partial_fh", None):
+                return
+            try:
+                line = json.dumps({"kind": kind, "data": payload}, default=str)
+                self._partial_fh.write(line + "\\n")
+                self._partial_fh.flush()
+                try:
+                    os.fsync(self._partial_fh.fileno())
+                except OSError:
+                    pass
+            except (OSError, ValueError, TypeError):
+                pass
+
+        def finalize_partial(self, success):
+            """Close and dispose of the partial log. On success, delete it
+            (the real *_transcript.md / *_meeting_notes.md are now durable).
+            On failure, rename to *.recovered.jsonl so the next startup can
+            re-finalize. We never blindly unlink orphan partials from prior
+            runs - only this session's file."""
+            fh = getattr(self, "_partial_fh", None)
+            path = getattr(self, "_partial_path", None)
+            if fh is not None:
+                try: fh.close()
+                except OSError: pass
+                self._partial_fh = None
+            # Always dispose of the human-readable mirror together with the
+            # JSONL - they share a lifetime. On failure we still drop the
+            # live.txt because the JSONL (which we keep as .recovered.jsonl)
+            # is the source of truth for next-startup recovery; live.txt is
+            # only an in-flight convenience.
+            live = getattr(self, "_live_path", None)
+            if live is not None:
+                try: live.unlink(missing_ok=True)
+                except OSError: pass
+            if path is None or not path.exists():
+                return
+            try:
+                if success:
+                    path.unlink(missing_ok=True)
+                else:
+                    recovered = path.with_suffix("").with_suffix(".recovered.jsonl")
+                    path.rename(recovered)
+            except OSError:
+                pass
+
         def on_transcript(self, text, seg_data):
             # Wall-clock HH:MM:SS for display + an epoch timestamp for merging
             # with speaker signals. In batch/post-process mode, seg_data
@@ -4478,6 +4684,37 @@ _MODULE_APP = textwrap.dedent('''\
                 ts_epoch = now.timestamp()
                 seg_data["_recv_epoch"] = ts_epoch
             speaker = seg_data.get("speaker", "Unknown")
+
+            # ── Live speaker-name rewriting ────────────────────────────────
+            # If diarize labelled this as a generic "Speaker N" / "Unknown" /
+            # "Other" AND the vision model recently saw a clear active speaker
+            # (highlighted tile), use that name immediately - no waiting for
+            # end-of-session post-processing. Window is tight (10s) because
+            # who's talking can change fast.
+            try:
+                import re as _re_live
+                generic = (
+                    not speaker
+                    or speaker in ("Unknown", "Other")
+                    or _re_live.match(r"(?i)^speaker[_ ]?\\d+$", speaker)
+                )
+                if generic and getattr(self, "_latest_active_speaker", (0, ""))[1]:
+                    last_ts, last_name = self._latest_active_speaker
+                    if last_ts and (ts_epoch - last_ts) <= 10.0 and last_name:
+                        speaker = last_name
+                        seg_data["speaker"] = last_name
+                        seg_data["_live_renamed"] = True
+                # Also feed any non-generic name (e.g. "You") through the
+                # canonicalizer so audio/vision-side variants of the same
+                # person collapse to one label.
+                elif speaker and speaker not in ("You", "Unknown", "Other") and not _re_live.match(r"(?i)^speaker[_ ]?\\d+$", speaker):
+                    canon = self._canonicalize(speaker)
+                    if canon and canon != speaker:
+                        seg_data["speaker"] = canon
+                        speaker = canon
+            except Exception:
+                pass
+
             entry = f"[{ts_str}] [{speaker}] {seg_data.get('text', text)}"
             self.transcript_segments.append(entry)
             self.raw_segments.append(seg_data)
@@ -4488,12 +4725,91 @@ _MODULE_APP = textwrap.dedent('''\
             else:
                 color = "\\033[96m"
             print(f"  {color}\\u25b8\\033[0m {entry}", flush=True)
+            # Crash-survivable: structured JSONL in NOTES_DIR (recoverable) +
+            # legacy plain-text mirror in TMP_DIR (kept for back-compat).
+            self._log_event("segment", {
+                "ts_str": ts_str,
+                "ts_epoch": ts_epoch,
+                "speaker": speaker,
+                "text": seg_data.get("text", text),
+                "entry": entry,
+                "seg_data": {k: v for k, v in seg_data.items()
+                             if k in ("speaker", "text", "_recv_epoch", "start", "end")},
+            })
+            # Plain-text mirror in NOTES_DIR for `tail -f`. Per-session
+            # filename so concurrent runs don't clobber each other and so
+            # an orphan from a crashed session is discoverable next to the
+            # JSONL (no more digging in TMP_DIR/_live_transcript.txt).
             try:
-                live_path = TMP_DIR / "_live_transcript.txt"
-                with open(live_path, "a") as f:
-                    f.write(entry + "\\n")
+                if getattr(self, "_live_path", None):
+                    with open(self._live_path, "a") as f:
+                        f.write(entry + "\\n")
             except OSError:
                 pass
+
+        # ── Name canonicalization ─────────────────────────────────────────
+        def _canonicalize(self, name):
+            """Return the canonical form of `name`, learning new variants on
+            the fly. Two names cluster together if one's tokens are a subset
+            of the other's, OR they share a long common token. This collapses
+            "Moneesh", "Moneesh Reddy", "M. Reddy" into one canonical name
+            (the longest variant seen wins as canonical). Case-insensitive."""
+            if not name:
+                return name
+            n = name.strip()
+            if not n:
+                return n
+            key = n.lower()
+            cmap = self._name_canonical
+            if key in cmap:
+                return cmap[key]
+
+            def _tokens(s):
+                import re as _re
+                # Drop punctuation; split on whitespace; ignore single-letter
+                # initials (e.g. "M.") - they match anything and would over-merge.
+                toks = _re.findall(r"[A-Za-z][A-Za-z'\\-]+", s.lower())
+                return [t for t in toks if len(t) >= 2]
+
+            new_tokens = set(_tokens(n))
+            best_canonical = None
+            for variant_key, canonical in list(cmap.items()):
+                v_tokens = set(_tokens(variant_key))
+                if not v_tokens or not new_tokens:
+                    continue
+                # Token-subset match (one is contained in the other) =
+                # near-certain same person.
+                if v_tokens <= new_tokens or new_tokens <= v_tokens:
+                    best_canonical = canonical
+                    break
+                # Otherwise require at least one shared multi-char token.
+                shared = v_tokens & new_tokens
+                if shared and any(len(t) >= 3 for t in shared):
+                    best_canonical = canonical
+                    break
+
+            if best_canonical is None:
+                # First time we see this person.
+                cmap[key] = n
+                return n
+
+            # Pick the longer, more-token-rich form as the canonical going
+            # forward, so "Moneesh Reddy" beats "Moneesh".
+            existing = best_canonical
+            ex_tokens = _tokens(existing)
+            new_full = n
+            if len(_tokens(new_full)) > len(ex_tokens) or (
+                len(_tokens(new_full)) == len(ex_tokens) and len(new_full) > len(existing)
+            ):
+                # Promote new_full to canonical, retroactively update every
+                # variant that pointed at the old canonical.
+                for k, v in list(cmap.items()):
+                    if v == existing:
+                        cmap[k] = new_full
+                cmap[key] = new_full
+                return new_full
+            cmap[key] = existing
+            return existing
 
         def on_screen_context(self, context, signals=None):
             """Screen-analysis callback. New two-arg form: context text + signals dict.
@@ -4505,14 +4821,31 @@ _MODULE_APP = textwrap.dedent('''\
             """
             ts_str = datetime.now().strftime("%H:%M:%S")
             if signals:
+                # Canonicalize participant names + active speaker BEFORE
+                # storing them, so later joins / votes operate on a single
+                # name per real person.
+                raw_active = signals.get("active_speaker", "") or ""
+                raw_parts = list(signals.get("participants", []) or [])
+                # Feed every participant through the canonicalizer first so
+                # the canonical map is populated before active_speaker lookup.
+                canon_parts = [self._canonicalize(p) for p in raw_parts]
+                canon_active = self._canonicalize(raw_active) if raw_active else ""
+                # Track the latest high-confidence active speaker so live
+                # transcript segments can be relabeled in real time.
+                if canon_active:
+                    self._latest_active_speaker = (
+                        signals.get("ts_recorded", datetime.now().timestamp()),
+                        canon_active,
+                    )
                 self.speaker_signals.append((
                     signals.get("ts_recorded", datetime.now().timestamp()),
-                    signals.get("active_speaker", "") or "",
-                    list(signals.get("participants", []) or []),
+                    canon_active,
+                    canon_parts,
                     signals.get("shared_content", "") or "",
                 ))
-                for p in signals.get("participants", []) or []:
-                    self.all_participants.add(p)
+                for p in canon_parts:
+                    if p:
+                        self.all_participants.add(p)
                 ms = signals.get("inference_ms", 0)
                 if ms:
                     self.vision_latencies_ms.append(ms)
@@ -4526,6 +4859,27 @@ _MODULE_APP = textwrap.dedent('''\
             else:
                 print(f"  \\033[94m\\u25c9\\033[0m Screen analysed at {ts_str}", flush=True)
             self.screen_contexts.append(f"[{ts_str}] {context}")
+            # Crash-survivable: capture both the rendered screen-context line
+            # AND the structured signals (used by _rewrite_speaker_labels) so
+            # recovery on next start can rebuild the full transcript - not
+            # just the audio-only fallback.
+            try:
+                sig_payload = None
+                if signals:
+                    sig_payload = {
+                        "ts_recorded": signals.get("ts_recorded"),
+                        "active_speaker": signals.get("active_speaker", "") or "",
+                        "participants": list(signals.get("participants", []) or []),
+                        "shared_content": signals.get("shared_content", "") or "",
+                        "inference_ms": signals.get("inference_ms", 0),
+                    }
+                self._log_event("screen", {
+                    "ts_str": ts_str,
+                    "context": context,
+                    "signals": sig_payload,
+                })
+            except Exception:
+                pass
 
 
         # ── Speaker-name post-processing ──────────────────────────────────────
@@ -4641,6 +4995,194 @@ _MODULE_APP = textwrap.dedent('''\
             if mapping:
                 print(f"  \\033[92m\\u2713\\033[0m  Speaker mapping: {mapping}")
             return rewritten
+
+        # ── Audio-side name matching ──────────────────────────────────────
+        def _audio_side_name_match(self):
+            """Use vocative cues in the audio transcript to assign names to
+            generic speakers.
+
+            Premise: in real meetings people address each other by name -
+            "Hey Moneesh, what do you think?" or "Yeah, thanks Moneesh." -
+            and the named person almost always speaks next. So if segment i
+            ends with a participant name and segment i+1 has a generic label
+            within ~30s, rewrite i+1 to that name.
+
+            Names to look for come from `all_participants` (vision-derived
+            and canonicalized). First-name and last-name tokens are matched
+            too so "Hey Moneesh," resolves to "Moneesh Reddy".
+
+            Runs AFTER the vision-based `_rewrite_speaker_labels` so it only
+            fills in labels that vision couldn't disambiguate.
+
+            Returns the number of segments whose label was rewritten.
+            """
+            if not self.raw_segments or not self.all_participants:
+                return 0
+            import re as _re
+
+            def is_generic(label):
+                if not label:
+                    return True
+                l = label.strip()
+                if _re.match(r"(?i)^speaker[_ ]?\\d+$", l):
+                    return True
+                if _re.match(r"(?i)^SPEAKER_\\d+$", l):
+                    return True
+                if l in ("Unknown", "Other", ""):
+                    return True
+                return False
+
+            # Build {token -> canonical name} so "Moneesh" or "Reddy" both
+            # map to "Moneesh Reddy". Multi-char tokens only - single
+            # letters would over-match ("a", "I", initials).
+            token_to_canon = {}
+            for canonical in self.all_participants:
+                if not canonical or not canonical.strip():
+                    continue
+                token_to_canon[canonical.lower()] = canonical
+                for tok in _re.findall(r"[A-Za-z][A-Za-z'\\-]+", canonical):
+                    if len(tok) >= 3:
+                        token_to_canon.setdefault(tok.lower(), canonical)
+
+            if not token_to_canon:
+                return 0
+
+            # Pre-compile: any known name at the END of the segment text
+            # (optionally followed by punctuation/whitespace). End-of-segment
+            # is the strongest vocative signal - "..., Moneesh?" almost
+            # always means Moneesh speaks next.
+            tokens_sorted = sorted(token_to_canon.keys(), key=len, reverse=True)
+            pat = _re.compile(
+                r"(?i)\\b(" + "|".join(_re.escape(t) for t in tokens_sorted) +
+                r")\\b[\\s,?.!]*$"
+            )
+
+            rewritten = 0
+            for i in range(len(self.raw_segments) - 1):
+                cur = self.raw_segments[i]
+                nxt = self.raw_segments[i + 1]
+                nxt_sp = nxt.get("speaker", "")
+                if not is_generic(nxt_sp):
+                    continue
+                # Vocative addressing only counts if the addressee speaks
+                # within 30s. Beyond that we're matching coincidence.
+                t_cur = cur.get("_recv_epoch", 0)
+                t_nxt = nxt.get("_recv_epoch", 0)
+                if t_cur and t_nxt and (t_nxt - t_cur) > 30:
+                    continue
+                text = (cur.get("text") or "").strip()
+                if not text:
+                    continue
+                m = pat.search(text)
+                if not m:
+                    continue
+                hit = m.group(1).lower()
+                canonical = token_to_canon.get(hit)
+                if not canonical:
+                    continue
+                # A person doesn't address themselves in the third person -
+                # skip if cur's speaker IS the addressee.
+                if cur.get("speaker", "").strip().lower() == canonical.lower():
+                    continue
+                canonical = self._canonicalize(canonical)
+                old = nxt_sp
+                nxt["speaker"] = canonical
+                idx2 = i + 1
+                line = self.transcript_segments[idx2] if idx2 < len(self.transcript_segments) else ""
+                if line:
+                    self.transcript_segments[idx2] = line.replace(f"[{old}]", f"[{canonical}]", 1)
+                rewritten += 1
+            return rewritten
+
+        # ── Smart screenshot retention ────────────────────────────────────
+        def _finalize_screen_archive(self):
+            """Decide what to keep in the deduplicated screenshot archive.
+
+            Two cases:
+              A) No participant ever shared their screen during the meeting.
+                 The archived frames are just video tiles + app chrome -
+                 not worth keeping. Delete the whole archive directory.
+              B) Someone shared content. Keep only frames whose nearest
+                 vision-signal `shared_content` differs from the previously
+                 kept frame's. This drops near-duplicates that the perceptual
+                 hash filter let through (cursor flicker, subtle re-renders
+                 of the same slide).
+
+            Returns (kept_count, deleted_count). Safe to call when no archive
+            exists (returns (0, 0)).
+            """
+            archive_dir = getattr(self, "_screen_archive_dir", None)
+            state = getattr(self, "_screen_archive_state", None) or {}
+            frames = list(state.get("frames") or [])
+            if not archive_dir:
+                return (0, 0)
+            import os as _os
+            import shutil as _sh
+            import bisect
+
+            had_share = any(
+                (sig[3] or "").strip()
+                for sig in self.speaker_signals
+                if len(sig) >= 4
+            )
+
+            # Case A: nothing was ever shared. Drop the whole archive -
+            # just video-tile crops aren't worth the disk footprint.
+            if not had_share:
+                deleted = len(frames)
+                try:
+                    _sh.rmtree(archive_dir, ignore_errors=True)
+                except OSError:
+                    pass
+                state["frames"] = []
+                self._screen_archive_dir = None
+                return (0, deleted)
+
+            # Case B: at least one frame had shared content. Walk frames in
+            # chronological order, keep only those whose nearest signal's
+            # `shared_content` differs from the previously kept frame's.
+            if not frames:
+                return (0, 0)
+
+            sigs = sorted(
+                ((s[0], (s[3] or "").strip()) for s in self.speaker_signals if len(s) >= 4),
+                key=lambda x: x[0],
+            )
+            sig_ts = [s[0] for s in sigs]
+            sig_share = [s[1] for s in sigs]
+
+            def share_at(epoch):
+                if not sig_ts:
+                    return ""
+                i = bisect.bisect_left(sig_ts, epoch)
+                cand = []
+                if i > 0:
+                    cand.append(i - 1)
+                if i < len(sig_ts):
+                    cand.append(i)
+                nearest = min(cand, key=lambda j: abs(sig_ts[j] - epoch))
+                # 15s window: vision runs every ~2s, so anything farther
+                # means the signal at this frame was missing.
+                if abs(sig_ts[nearest] - epoch) > 15:
+                    return ""
+                return sig_share[nearest]
+
+            kept = 0
+            deleted = 0
+            last_share = None  # sentinel: first frame is always kept
+            for (epoch, fname) in sorted(frames, key=lambda x: x[0]):
+                share = share_at(epoch)
+                path = _os.path.join(archive_dir, fname)
+                if last_share is None or share != last_share:
+                    last_share = share
+                    kept += 1
+                else:
+                    try:
+                        _os.remove(path)
+                        deleted += 1
+                    except OSError:
+                        pass
+            return (kept, deleted)
 
         def start_follow_watchdog(self, pid, label="selected app", poll_s=2.0, debounce=2):
             """Stop the session when the selected app's PID exits.
@@ -4761,11 +5303,24 @@ _MODULE_APP = textwrap.dedent('''\
             screen-context timeline, labelled "(follow)" and "(share)".
             """
             _ensure_dir()
+            # Per-session screenshot archive: deduplicated unique frames are
+            # copied here so the user can review WHAT was on screen, not just
+            # the model's text description of it.
+            session_stem = self.start_time.strftime("%Y%m%d_%H%M%S")
+            archive_dir = str(NOTES_DIR / (session_stem + "_screens"))
+            self._screen_archive_dir = archive_dir
+            self._screen_archive_state = {"last_hash": None, "count": 0, "frames": []}
+
             # Primary follow capture
             cap = threading.Thread(
                 target=_capture_loop,
                 args=(interval, self._stop_event),
-                kwargs={"display_index": display_index, "window_id": window_id},
+                kwargs={
+                    "display_index": display_index,
+                    "window_id": window_id,
+                    "archive_dir": archive_dir,
+                    "archive_state": self._screen_archive_state,
+                },
                 daemon=True,
             )
             ana = threading.Thread(target=_analysis_loop, args=(self.on_screen_context, self._stop_event), daemon=True)
@@ -4955,9 +5510,184 @@ _MODULE_APP = textwrap.dedent('''\
             return p
 
 
+    # ── Crash recovery ────────────────────────────────────────────────────────
+
+    def _recover_partials():
+        """Scan NOTES_DIR for orphan *.partial.jsonl files - one is left behind
+        every time the previous run crashed (segfault, OOM-kill, power loss)
+        before save_raw / save_transcript / save_enhanced could run.
+
+        For each, we rebuild a MeetingSession in memory by replaying the
+        JSONL events, then call save_raw + save_transcript so the meeting
+        appears under NOTES_DIR/ alongside live ones. We deliberately skip
+        enhancement (LLM call could be slow / blocked); the user can re-run
+        it manually if they want a summary. The partial is renamed to
+        *.recovered.jsonl as evidence; a second startup won't re-process it."""
+        # One-shot upgrade migration: older versions wrote a singleton
+        # TMP_DIR/_live_transcript.txt instead of per-session files in
+        # NOTES_DIR. If we still see one on disk and it has content from
+        # a recent-enough run that the user might care about (mtime within
+        # a day), copy it into NOTES_DIR with a recovered.live.txt name so
+        # the data isn't silently nuked on next-tmp-sweep.
+        try:
+            legacy = TMP_DIR / "_live_transcript.txt"
+            if legacy.exists() and legacy.stat().st_size > 0:
+                import time as _t
+                age = _t.time() - legacy.stat().st_mtime
+                if age < 86400:
+                    target = NOTES_DIR / (
+                        datetime.fromtimestamp(legacy.stat().st_mtime)
+                        .strftime("%Y%m%d_%H%M%S") + ".recovered.live.txt"
+                    )
+                    if not target.exists():
+                        target.write_bytes(legacy.read_bytes())
+                        print(f"  \\033[93m!\\033[0m  Migrated legacy live transcript to {target.name}")
+                legacy.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        try:
+            partials = sorted(NOTES_DIR.glob("*.partial.jsonl"))
+        except OSError:
+            return
+        if not partials:
+            return
+        print(f"  \\033[93m!\\033[0m  Found {len(partials)} unfinalized session(s) "
+              f"from a previous crash. Recovering...")
+        for pp in partials:
+            try:
+                _recover_one_partial(pp)
+            except Exception as exc:
+                print(f"  \\033[91m\\u2717\\033[0m  Could not recover {pp.name}: {exc}")
+
+    def _recover_one_partial(partial_path):
+        """Replay a single *.partial.jsonl and write the *_raw_transcript.md
+        + *_transcript.md it never got to write. Best-effort - a corrupt JSON
+        line is skipped, not fatal."""
+        from datetime import datetime as _dt
+        events = []
+        with open(partial_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    continue
+        if not events:
+            partial_path.unlink(missing_ok=True)
+            return
+
+        # Find session_start to get the correct start_time.
+        start_iso = None
+        for ev in events:
+            if ev.get("kind") == "session_start":
+                start_iso = ev.get("data", {}).get("start_time")
+                break
+        if not start_iso:
+            # Fall back to filename stem (YYYYMMDD_HHMMSS.partial -> datetime).
+            try:
+                stem = partial_path.name.split(".partial.jsonl")[0]
+                start_iso = _dt.strptime(stem, "%Y%m%d_%H%M%S").isoformat()
+            except ValueError:
+                start_iso = _dt.now().isoformat()
+
+        # Build a session shell WITHOUT touching __init__ (which would create
+        # a fresh partial file). We assign attributes directly.
+        session = MeetingSession.__new__(MeetingSession)
+        session.template = "default"
+        session.enable_screen = True
+        session.defer_transcription = False
+        session._deferred_segments = []
+        session.transcript_segments = []
+        session.raw_segments = []
+        session.screen_contexts = []
+        session.user_notes = ""
+        session.start_time = _dt.fromisoformat(start_iso)
+        session._stop_event = threading.Event()
+        session.speaker_signals = []
+        session.all_participants = set()
+        session.vision_latencies_ms = []
+        session._partial_fh = None
+        session._partial_path = partial_path
+
+        for ev in events:
+            kind = ev.get("kind")
+            data = ev.get("data", {}) or {}
+            if kind == "segment":
+                session.transcript_segments.append(data.get("entry", ""))
+                seg = dict(data.get("seg_data") or {})
+                if "_recv_epoch" not in seg and data.get("ts_epoch"):
+                    seg["_recv_epoch"] = data["ts_epoch"]
+                if "speaker" not in seg:
+                    seg["speaker"] = data.get("speaker", "Unknown")
+                if "text" not in seg:
+                    seg["text"] = data.get("text", "")
+                session.raw_segments.append(seg)
+            elif kind == "screen":
+                ts_str = data.get("ts_str", "")
+                ctx = data.get("context", "")
+                if ctx:
+                    session.screen_contexts.append(f"[{ts_str}] {ctx}")
+                sig = data.get("signals")
+                if sig:
+                    session.speaker_signals.append((
+                        sig.get("ts_recorded") or 0,
+                        sig.get("active_speaker", "") or "",
+                        list(sig.get("participants") or []),
+                        sig.get("shared_content", "") or "",
+                    ))
+                    for p in (sig.get("participants") or []):
+                        session.all_participants.add(p)
+                    if sig.get("inference_ms"):
+                        session.vision_latencies_ms.append(sig["inference_ms"])
+
+        if not session.raw_segments and not session.screen_contexts:
+            partial_path.unlink(missing_ok=True)
+            return
+
+        # Re-apply vision-based speaker name rewriting BEFORE save (same order
+        # as the live path uses).
+        try:
+            if session.speaker_signals and session.raw_segments:
+                session._rewrite_speaker_labels()
+        except Exception:
+            pass
+
+        try:
+            raw_path = session.save_raw()
+            tr_path = session.save_transcript()
+            print(f"  \\033[92m\\u2713\\033[0m  Recovered: {tr_path.name} "
+                  f"(+ {raw_path.name})")
+        except Exception as exc:
+            print(f"  \\033[91m\\u2717\\033[0m  Save failed for {partial_path.name}: {exc}")
+            return
+
+        # Mark the partial as processed so we don't reprocess on next start.
+        try:
+            recovered = partial_path.with_suffix("").with_suffix(".recovered.jsonl")
+            partial_path.rename(recovered)
+        except OSError:
+            partial_path.unlink(missing_ok=True)
+
+        # Drop the orphan live.txt mirror (its content is now redundant with
+        # the saved *_transcript.md / *_raw_transcript.md).
+        try:
+            stem = partial_path.name.split(".partial.jsonl")[0]
+            (NOTES_DIR / (stem + ".live.txt")).unlink(missing_ok=True)
+        except OSError:
+            pass
+
     # ── Subcommand: start ─────────────────────────────────────────────────────
 
     def cmd_start(args):
+        # ── Step 0: recover any partials from a previous crashed session ──
+        # Done first so the user immediately sees crashed transcripts surface
+        # as proper *_transcript.md / *_raw_transcript.md files - before they
+        # start a new meeting whose timestamp could collide.
+        _recover_partials()
+
         # ── Step 1: auto-configure audio (every start) ──
         print()
         print("  \\033[1m\\u266b Audio configuration\\033[0m")
@@ -5223,16 +5953,26 @@ _MODULE_APP = textwrap.dedent('''\
         else:
             print("  \\033[92m\\u2713\\033[0m  Transcription starting (pipelined, ~30s segments, no gaps)...\\n")
 
+        # Catch ALL exceptions, not just KeyboardInterrupt: a Python-level
+        # exception inside the recorder/transcription threads used to skip
+        # the entire save path below, leaving the user with nothing on disk
+        # except the *.partial.jsonl. Now any exception still falls through
+        # to save_raw / save_transcript so the data captured before the
+        # error is durable.
         try:
             session.start_transcription(backend=backend, follow_pids=follow_pids)
         except KeyboardInterrupt:
             pass
+        except Exception as exc:
+            print(f"\\n  \\033[91m\\u2717\\033[0m  Transcription error: {exc}")
+            print(f"  \\033[93m!\\033[0m  Saving whatever was captured before the error...")
 
         session._stop_event.set()
 
-        # Keep _live_transcript.txt in place until the enhanced note is saved,
-        # so it survives as crash-recovery if enhancement fails or is interrupted.
-        live_path = TMP_DIR / "_live_transcript.txt"
+        # Crash-recovery is now handled by the per-session NOTES_DIR/<ts>.partial.jsonl
+        # + <ts>.live.txt pair (both managed by MeetingSession). The legacy
+        # singleton TMP_DIR/_live_transcript.txt is gone - it was unsafe
+        # (concurrent runs clobbered each other; orphan deletion was blind).
 
         print("\\n")
         print("\\u2550" * 59)
@@ -5261,6 +6001,15 @@ _MODULE_APP = textwrap.dedent('''\
                 print(f"  \\033[92m\\u2713\\033[0m  Speaker names: rewrote {n_rewritten} segment labels "
                       f"using vision-model active-speaker signals.")
 
+        # Audio-side name matching: catches generic labels that vision
+        # didn't disambiguate, by spotting when one speaker addresses
+        # another by name ("Hey Moneesh,") and the next speaker is generic.
+        if session.raw_segments and session.all_participants:
+            n_voc = session._audio_side_name_match()
+            if n_voc:
+                print(f"  \\033[92m\\u2713\\033[0m  Speaker names: rewrote {n_voc} additional segment labels "
+                      f"from audio-side vocative cues.")
+
         raw_path = session.save_raw()
         print(f"  \\033[92m\\u2713\\033[0m  Raw transcript saved: {raw_path}")
 
@@ -5270,10 +6019,8 @@ _MODULE_APP = textwrap.dedent('''\
 
         if not session.transcript_segments and not session.screen_contexts:
             print("  No transcript or screen context captured. Exiting.")
-            try:
-                live_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            # Empty session - drop the (also empty) partial JSONL + live.txt.
+            session.finalize_partial(success=True)
             return
 
         if not session.transcript_segments:
@@ -5282,24 +6029,49 @@ _MODULE_APP = textwrap.dedent('''\
         print(f"  Generating enhanced notes (template: {args.template})...")
         print("  This may take 30-60 seconds...\\n")
 
-        enhanced = enhance_notes(
-            transcript=session.get_full_transcript(),
-            screen_context=session.get_screen_summary(),
-            user_notes=session.user_notes,
-            template=args.template,
-        )
-        note_path = session.save_enhanced(enhanced)
+        try:
+            enhanced = enhance_notes(
+                transcript=session.get_full_transcript(),
+                screen_context=session.get_screen_summary(),
+                user_notes=session.user_notes,
+                template=args.template,
+            )
+            note_path = session.save_enhanced(enhanced)
+        except (KeyboardInterrupt, Exception) as exc:
+            # Raw + transcript files are already on disk above. Enhancement
+            # is a nice-to-have - skip it but DO NOT lose the meeting.
+            # Leaving the partial JSONL in place would confuse next-startup
+            # recovery (it would try to re-save), so finalize as success now.
+            print(f"  \\033[93m!\\033[0m  Enhancement step failed: {exc}")
+            print(f"  \\033[90m    Raw + transcript already saved at: {raw_path}\\033[0m")
+            session.finalize_partial(success=True)
+            return
         print(enhanced)
         print()
         print(f"  \\033[92m\\u2713\\033[0m  Summary:    {note_path}")
         print(f"  \\033[92m\\u2713\\033[0m  Transcript: {transcript_path}")
         print(f"  \\033[90m    (raw: {raw_path.name})\\033[0m")
-
-        # Enhanced note is now safely persisted. Remove the live transcript temp file.
+        # Smart screenshot retention: if no screen share happened, drop
+        # the entire archive (the frames are just video tiles + chrome).
+        # If someone shared, keep only frames whose nearest-vision
+        # `shared_content` differs from the previously kept frame's.
         try:
-            live_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            ar_kept, ar_deleted = session._finalize_screen_archive()
+        except Exception as exc:
+            ar_kept, ar_deleted = 0, 0
+            print(f"  \\033[93m!\\033[0m  Screenshot finalize failed: {exc}")
+        ar_dir = getattr(session, "_screen_archive_dir", None)
+        if ar_kept and ar_dir:
+            print(f"  \\033[92m\\u2713\\033[0m  Screenshots: kept {ar_kept} unique screen-share frame(s) "
+                  f"({ar_deleted} duplicate(s) removed) at {ar_dir}/")
+        elif ar_deleted and not ar_dir:
+            print(f"  \\033[90m    Screenshots: no screen share detected - "
+                  f"discarded {ar_deleted} captured frame(s).\\033[0m")
+
+        # Enhanced note is now safely persisted. Drop this session's partial
+        # JSONL + live.txt (only this session's - recovery code on next
+        # startup is the one allowed to clean up orphans).
+        session.finalize_partial(success=True)
 
         print("\\n  --- Ask questions about this meeting (type 'quit' to exit) ---\\n")
         transcript = session.get_full_transcript()
@@ -5326,7 +6098,13 @@ _MODULE_APP = textwrap.dedent('''\
             reverse=True,
         )
         transcripts = sorted(NOTES_DIR.glob("*_transcript.md"), reverse=True)
-        if not summaries and not transcripts:
+        # Partials = sessions that started but never finalized (process
+        # crashed, killed, or still running in another window). Surfaced
+        # explicitly so the user knows there's data pending recovery on
+        # next `muneem start` - and isn't surprised when an old transcript
+        # suddenly appears.
+        partials = sorted(NOTES_DIR.glob("*.partial.jsonl"), reverse=True)
+        if not summaries and not transcripts and not partials:
             print("  No meeting notes found yet. Run 'muneem start' first.")
             return
 
@@ -5361,6 +6139,18 @@ _MODULE_APP = textwrap.dedent('''\
             for i, t in enumerate(transcripts[:20], 1):
                 size = t.stat().st_size
                 print(f"  {i:>3}.  {t.name}  ({size:,} bytes)")
+        if partials:
+            print()
+            print(f"  \\033[93m\\033[1mUnfinalized sessions ({len(partials)}):\\033[0m  "
+                  f"\\033[90m(will be auto-recovered on next `muneem start`)\\033[0m")
+            for i, pp in enumerate(partials[:20], 1):
+                size = pp.stat().st_size
+                # Count events to give the user a feel for how much was captured.
+                try:
+                    n_events = sum(1 for _ in open(pp))
+                except OSError:
+                    n_events = 0
+                print(f"  {i:>3}.  {pp.name}  ({size:,} bytes, {n_events} events)")
         print()
         print(f"  \\033[90m  muneem notes last        \\u2192 open most recent summary\\033[0m")
         print(f"  \\033[90m  muneem notes transcript  \\u2192 open most recent transcript\\033[0m")
@@ -5677,7 +6467,7 @@ _MODULE_APP = textwrap.dedent('''\
         muneem start                     Start a meeting (auto-detects call apps for screen)
         muneem start --no-screen         Audio only, no screen capture
         muneem start --screen            Force screen capture even without detected call app
-        muneem start --template standup  Use a specific template (standup|one_on_one|discovery)
+        muneem start --template brief    Use a specific template (brief|standup|one_on_one|discovery)
         muneem start --display 2         Follow screen 2
         muneem start --window Zoom       Follow Zoom window
         muneem start --window-id 12345   Follow by window ID
@@ -5719,6 +6509,41 @@ _MODULE_APP = textwrap.dedent('''\
     # ── Main dispatcher ───────────────────────────────────────────────────────
 
     def main():
+        # ── Crash-trace dumping ──
+        # faulthandler prints a Python traceback when the process dies on a
+        # native segfault / SIGABRT / SIGFPE / SIGILL. Without this, a crash
+        # in whisperx / sherpa-onnx / Core Audio Tap exits silently with no
+        # evidence of what went wrong (which is what produced the user's
+        # original lastCrashed_transcripts.txt with no traceback). The log
+        # is appended-to so multiple crashes can be compared.
+        try:
+            import faulthandler
+            crash_log_path = NOTES_DIR / "_faulthandler.log"
+            crash_log_fh = open(crash_log_path, "a")
+            crash_log_fh.write("\\n--- muneem start " + datetime.now().isoformat() + " pid=" + str(os.getpid()) + " ---\\n")
+            crash_log_fh.flush()
+            faulthandler.enable(file=crash_log_fh, all_threads=True)
+        except Exception:
+            pass
+
+        # ── Graceful-stop signal handlers ──
+        # SIGTERM (Activity Monitor "Quit", `kill <pid>`, OS shutdown) and
+        # SIGHUP (terminal closed) used to kill the process instantly with
+        # no save. Convert them to KeyboardInterrupt so the existing Ctrl+C
+        # save path runs. SIGINT is already handled by Python's default.
+        try:
+            import signal as _sig
+            def _graceful(signum, _frame):
+                raise KeyboardInterrupt()
+            for _sn in ("SIGTERM", "SIGHUP"):
+                if hasattr(_sig, _sn):
+                    try:
+                        _sig.signal(getattr(_sig, _sn), _graceful)
+                    except (OSError, ValueError):
+                        pass
+        except Exception:
+            pass
+
         if len(sys.argv) < 2 or sys.argv[1] in ("help", "-h", "--help"):
             cmd_help()
             return
