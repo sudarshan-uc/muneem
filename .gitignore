@@ -36,3 +36,6 @@ docs/
 muneem-traces.txt
 *.trace
 traces/
+
+# Local agent / assistant instruction files - never committed.
+CLAUDE.md
